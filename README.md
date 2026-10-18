@@ -10,7 +10,7 @@ kyte get https://github.com/kytelang/kyte-mongodb
 import mongodb;
 ```
 
-## Structure (SOLID)
+## Design
 
 Split by responsibility; consumers only touch the driver interface (`MongoDriver` / `MongoConnection`).
 
