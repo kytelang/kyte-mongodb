@@ -1,0 +1,67 @@
+// Live MongoDB integration gate. Drives connect -> find -> close MANY times ON A REACTOR (real async
+// socket I/O needs one; a bare @test has no reactor to resume the awaits). Run under
+// KYTE_ASAN=1 KYTE_ARC_AUDIT=1 to prove there is no double-free / use-after-free and no per-connection
+// leak on the OP_MSG wire path -- and specifically that opening and closing many connections in
+// sequence is clean (the historical async-owned-struct concern).
+//
+// Gated on KYTE_MONGO_URL so `kyte test` without a server is a no-op (CI stays green). To run live:
+//   KYTE_MONGO_URL='mongodb://127.0.0.1:27017/test' KYTE_ASAN=1 KYTE_ARC_AUDIT=1 kyte test
+
+import assert;
+import list;
+import string;
+import bytes;
+import env;
+import net.poller;
+import db;
+import mongodb;
+
+fn cell(c: long): int { return bytes.read_i32(c, 0) as int; }
+
+// connect, run one find (on a collection that need not exist -- an empty result is fine), close -- looped.
+// `okc` counts completed round-trips; a crash or hang would stop `done` reaching 1.
+async fn dbLoop(url: string, iters: int, done: long, okc: long): void {
+    let drv = mongodb.MongoDriver();
+    let ok = 0;
+    let i = 0;
+    while (i < iters) {
+        let conn = await drv.connect(url);
+        let rs = await conn.query("kyte_live_probe", List<DbValue>());
+        if (rs.rowCount() >= 0) { ok = ok + 1; }   // round-trip completed (0+ documents)
+        conn.close();
+        i = i + 1;
+    }
+    bytes.write_i32(okc, 0, ok);
+    bytes.write_i32(done, 0, 1);
+}
+
+@test
+fn live_connect_query_close_loop(): void {
+    let url = env.get("KYTE_MONGO_URL");
+    if (string.eql(url, "")) { return; }   // no live server configured -> skip
+
+    let iters = 25;
+    let r = poller.Reactor(64, 8192, 32);
+    poller.setCurrent(r.kq);
+    let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
+    let okc = bytes.alloc(4); bytes.write_i32(okc, 0, 0);
+
+    coroStart(dbLoop(url, iters, done, okc));
+
+    let guard = 0;
+    while (cell(done) == 0 && guard < 40000) {
+        let nev = r.pollComplete(500);
+        poller.batchBegin();
+        let i = 0;
+        while (i < nev) { kyte_reactor_resume(r.completedToken(i)); i = i + 1; }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(cell(done), 1);      // the loop finished (did not hang or crash)
+    assert.equalInt(cell(okc), iters);   // every connect+find+close round-trip completed
+
+    poller.setCurrent(0);
+    bytes.free(done);
+    bytes.free(okc);
+    r.destroy();
+}

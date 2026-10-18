@@ -1,0 +1,113 @@
+// wiremessage - the OP_MSG wire codec (SRP: bytes <-> frame). Wraps a BSON command
+// document in an OP_MSG frame and pulls the reply document back out. Pure over byte
+// buffers; the live socket framing (read a whole frame off the stream) is in the connection layer.
+//
+//   OP_MSG (opcode 2013): [ 16-byte MsgHeader | uint32 flagBits | section... ]
+//   section kind 0x00: a single BSON document (the command / the reply).
+import bytes;
+import serde.bson;
+
+const OP_MSG: int = 2013;
+pub const HEADER_LEN: int = 16;   // MsgHeader; the connection layer reads this first to learn the length
+// header(16) + flagBits(4) + section-kind(1) = 21 bytes before the BSON body.
+const BODY_OFFSET: int = 21;
+
+/// Wrap a command document in an OP_MSG frame. Returns the raw frame bytes.
+pub fn encodeOpMsg(requestId: int, command: bson.BsonDocument): string {
+    // `bson.serialize` returns a fresh rc=1 buffer; adopt it as a string so ARC
+    // frees it at scope end (a bare `ptr` is a value type and would leak).
+    let body: string = bson.serialize(command) as string;
+    let bsonLen = bytes.read_i32(body as ptr, 0);
+    let total = BODY_OFFSET + bsonLen;
+
+    let frame = bytes.alloc(total);
+    bytes.write_i32(frame, 0, total);       // messageLength
+    bytes.write_i32(frame, 4, requestId);   // requestID
+    bytes.write_i32(frame, 8, 0);           // responseTo
+    bytes.write_i32(frame, 12, OP_MSG);     // opCode
+    bytes.write_i32(frame, 16, 0);          // flagBits
+    bytes.write_byte(frame, 20, 0);         // section kind 0 (body)
+    let i = 0;
+    while (i < bsonLen) {
+        bytes.write_byte(frame, BODY_OFFSET + i, bytes.read_byte(body, i));
+        i = i + 1;
+    }
+    return frame as string;
+}
+
+/// Wrap a command in an OP_MSG frame using a KIND-1 document sequence: the command body (kind 0) omits
+/// the big array (documents/updates/deletes) and the array elements stream as a separate kind-1 section
+/// identified by `seqId`. This avoids nesting a large array inside the command doc -- the wire-efficient
+/// form for bulk writes. Section layout: [0x01][int32 sectionSize][cstring seqId][doc][doc]...] where
+/// sectionSize covers the size field itself + the identifier + all documents.
+pub fn encodeOpMsgSeq(requestId: int, command: bson.BsonDocument, seqId: string, docs: List<bson.BsonDocument>): string {
+    let body: string = bson.serialize(command) as string;
+    let bodyLen = bytes.read_i32(body as ptr, 0);
+
+    // Serialize each sequence document once; sum their lengths.
+    let parts = List<string>();
+    let docsLen = 0;
+    let di = 0;
+    while (di < docs.size()) {
+        let p: string = bson.serialize(docs.get(di) ?? bson.BsonDocument{ entries: List<bson.BsonEntry>() }) as string;
+        docsLen = docsLen + p.length;
+        parts.push(p);
+        di = di + 1;
+    }
+    let idLen = seqId.length + 1;                       // cstring identifier (NUL-terminated)
+    let sectionSize = 4 + idLen + docsLen;             // the size int32 + identifier + docs
+    // header(16) + flagBits(4) + kind0[1 + bodyLen] + kind1[1 + sectionSize]
+    let total = HEADER_LEN + 4 + 1 + bodyLen + 1 + sectionSize;
+
+    let frame = bytes.alloc(total);
+    bytes.write_i32(frame, 0, total);
+    bytes.write_i32(frame, 4, requestId);
+    bytes.write_i32(frame, 8, 0);
+    bytes.write_i32(frame, 12, OP_MSG);
+    bytes.write_i32(frame, 16, 0);                     // flagBits
+    bytes.write_byte(frame, 20, 0);                    // kind 0 (body)
+    let off = 21;
+    let bi = 0;
+    while (bi < bodyLen) { bytes.write_byte(frame, off + bi, bytes.read_byte(body, bi)); bi = bi + 1; }
+    off = off + bodyLen;
+    bytes.write_byte(frame, off, 1);                   // kind 1 (document sequence)
+    off = off + 1;
+    bytes.write_i32(frame, off, sectionSize);
+    off = off + 4;
+    let ci = 0;
+    while (ci < seqId.length) { bytes.write_byte(frame, off + ci, seqId[ci] & 255); ci = ci + 1; }
+    bytes.write_byte(frame, off + seqId.length, 0);    // cstring NUL
+    off = off + idLen;
+    let pi = 0;
+    while (pi < parts.size()) {
+        let p = parts.get(pi) ?? "";
+        let pj = 0;
+        while (pj < p.length) { bytes.write_byte(frame, off + pj, bytes.read_byte(p, pj)); pj = pj + 1; }
+        off = off + p.length;
+        pi = pi + 1;
+    }
+    return frame as string;
+}
+
+/// Parse the command document out of an OP_MSG reply frame.
+pub fn decodeOpMsg(frame: string): bson.BsonDocument {
+    // A truncated/closed read yields an empty frame -> return an empty doc rather than reading a
+    // length off a zero-length buffer (commandError then reports it as a failed command).
+    if (frame.length < BODY_OFFSET + 4) { return bson.BsonDocument{ entries: List<bson.BsonEntry>() }; }
+    let bsonLen = bytes.read_i32(frame as ptr, BODY_OFFSET);
+    let buf = bytes.alloc(bsonLen);
+    let i = 0;
+    while (i < bsonLen) {
+        bytes.write_byte(buf, i, bytes.read_byte(frame, BODY_OFFSET + i));
+        i = i + 1;
+    }
+    // Adopt the decode buffer as a string so ARC frees it; `deserialize` copies
+    // everything out, so releasing it after is safe.
+    let bufStr: string = buf as string;
+    return bson.deserialize(bufStr as ptr);
+}
+
+/// The total length declared in an OP_MSG frame header (its first int32).
+pub fn frameLength(frame: string): int {
+    return bytes.read_i32(frame as ptr, 0);
+}

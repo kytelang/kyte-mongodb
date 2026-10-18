@@ -1,0 +1,157 @@
+// Offline codec gate for the kyte-mongodb driver: OP_MSG framing, command shapes,
+// BSON round-trips, and the SCRAM message flow - all verified WITHOUT a server.
+import wiremessage;
+import operation;
+import serde.bson;
+import crypto.scram;
+import bytes;
+import list;
+import db;
+import assert;
+
+@test
+fn test_opmsg_roundtrip(): void {
+    let cmd = operation.helloCommand("admin");
+    let frame = wiremessage.encodeOpMsg(7, cmd);
+
+    // Header: messageLength == actual length; opcode == 2013 (OP_MSG); requestID == 7.
+    assert.equalInt(wiremessage.frameLength(frame), frame.length);
+    assert.equalInt(bytes.read_i32(frame as ptr, 12), 2013);
+    assert.equalInt(bytes.read_i32(frame as ptr, 4), 7);
+
+    // Decode recovers the command document.
+    let back = wiremessage.decodeOpMsg(frame);
+    assert.isTrue(bson.docFind(back, "hello") >= 0);
+    assert.equalStr(bson.docGetString(back, bson.docFind(back, "$db")), "admin");
+}
+
+@test
+fn test_find_and_insert_commands(): void {
+    let filter = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    filter.entries.push(bson.entryString("name", "ada"));
+    let find = operation.findCommand("test", "users", filter);
+    let back = wiremessage.decodeOpMsg(wiremessage.encodeOpMsg(1, find));
+    assert.equalStr(bson.docGetString(back, bson.docFind(back, "find")), "users");
+    assert.equalStr(bson.docGetString(back, bson.docFind(back, "$db")), "test");
+
+    let doc = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    doc.entries.push(bson.entryString("name", "ada"));
+    let ins = operation.insertCommand("test", "users", doc);
+    let backIns = wiremessage.decodeOpMsg(wiremessage.encodeOpMsg(2, ins));
+    assert.equalStr(bson.docGetString(backIns, bson.docFind(backIns, "insert")), "users");
+}
+
+@test
+fn test_saslstart_payload_binary(): void {
+    // The SCRAM client-first-message rides in a BSON binary payload; verify it
+    // survives an encode -> decode of the whole OP_MSG frame.
+    let c = scram.ScramClient{ username: "user", password: "pencil", clientNonce: "rOprNGfwEbeRWgbNEkqO" };
+    let clientFirst = c.clientFirstMessage();
+    let cmd = operation.saslStartCommand("admin", "SCRAM-SHA-256", clientFirst);
+    let back = wiremessage.decodeOpMsg(wiremessage.encodeOpMsg(1, cmd));
+    assert.equalStr(bson.docGetString(back, bson.docFind(back, "mechanism")), "SCRAM-SHA-256");
+    assert.equalStr(bson.docGetBinary(back, bson.docFind(back, "payload")),
+                    "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+}
+
+@test
+fn test_scram_flow_matches_rfc7677(): void {
+    // Drive the SCRAM message flow exactly as the driver's authenticate() would,
+    // using the RFC 7677 server-first-message. The client-final-message must carry
+    // the reference proof - proving the whole auth path end to end.
+    let c = scram.ScramClient{ username: "user", password: "pencil", clientNonce: "rOprNGfwEbeRWgbNEkqO" };
+    let serverFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    let clientFinal = c.clientFinalMessage(serverFirst);
+    assert.equalStr(clientFinal,
+        "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+
+    // And that client-final rides correctly in a saslContinue payload.
+    let cont = operation.saslContinueCommand("admin", 1, clientFinal);
+    let back = wiremessage.decodeOpMsg(wiremessage.encodeOpMsg(3, cont));
+    assert.equalStr(bson.docGetBinary(back, bson.docFind(back, "payload")), clientFinal);
+    assert.equalInt(bson.docGetInt(back, bson.docFind(back, "conversationId")), 1);
+}
+
+// T1: a failed command reply ({ok:0, errmsg, code}) is now surfaced by query/exec via commandError
+// (previously the driver only checked whether `ok` existed and reported success).
+@test
+fn test_command_error_surfacing(): void {
+    let fail = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    fail.entries.push(bson.entryInt("ok", 0));
+    fail.entries.push(bson.entryString("errmsg", "ns not found"));
+    fail.entries.push(bson.entryInt("code", 26));
+    let e = operation.commandError(fail);
+    assert.isTrue(!e.isEmpty());
+    assert.equalStr(e.message, "ns not found");
+    assert.equalStr(e.code, "26");
+
+    let good = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    good.entries.push(bson.entryInt("ok", 1));
+    assert.isTrue(operation.commandError(good).isEmpty());
+}
+
+// T3: a BSON document with an ObjectId (_id, type 0x07) + datetime must deserialize without desyncing
+// the parser -- previously types 7/9/17 were unhandled, so any real Mongo reply (every _id is an
+// ObjectId) misparsed. Hand-build { _id: ObjectId(00112233445566778899aabb), n: 42 } and read both.
+@test
+fn test_bson_objectid_decode(): void {
+    let oidHex = "00112233445566778899aabb";
+    // total(4) + [0x07 "_id\0" 12] + [0x10 "n\0" int32] + 0x00 = 29 bytes.
+    let d = bytes.alloc(29);
+    bytes.write_byte(d, 0, 29); bytes.write_byte(d, 1, 0); bytes.write_byte(d, 2, 0); bytes.write_byte(d, 3, 0);
+    let p = 4;
+    bytes.write_byte(d, p, 0x07); p = p + 1;
+    bytes.write_byte(d, p, 95); bytes.write_byte(d, p+1, 105); bytes.write_byte(d, p+2, 100); bytes.write_byte(d, p+3, 0); p = p + 4;  // "_id\0"
+    let k = 0;
+    while (k < 12) { bytes.write_byte(d, p + k, (nib(oidHex[k*2])*16) + nib(oidHex[k*2+1])); k = k + 1; }
+    p = p + 12;
+    bytes.write_byte(d, p, 0x10); p = p + 1;
+    bytes.write_byte(d, p, 110); bytes.write_byte(d, p+1, 0); p = p + 2;  // "n\0"
+    bytes.write_byte(d, p, 42); bytes.write_byte(d, p+1, 0); bytes.write_byte(d, p+2, 0); bytes.write_byte(d, p+3, 0); p = p + 4;
+    bytes.write_byte(d, p, 0);
+
+    let doc = bson.deserialize(d as ptr);
+    let idIdx = bson.docFind(doc, "_id");
+    assert.isTrue(idIdx >= 0);
+    assert.equalStr(bson.docGetObjectId(doc, idIdx), oidHex);
+    // The int AFTER the ObjectId is still read correctly -> the parser did not desync.
+    let nIdx = bson.docFind(doc, "n");
+    assert.isTrue(nIdx >= 0);
+    assert.equalInt(bson.docGetInt(doc, nIdx), 42);
+    bytes.free(d);
+}
+fn nib(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 97 + 10; }
+    return 0;
+}
+
+@test
+fn test_doc_to_json(): void {
+    // T5: BSON -> JSON so find() can return documents.
+    let d = bson.BsonDocument{ entries: list.List<bson.BsonEntry>() };
+    d.entries.push(bson.entryString("name", "ada"));
+    d.entries.push(bson.entryInt("age", 42));
+    d.entries.push(bson.entryBool("active", 1));
+    assert.equalStr(bson.docToJson(d), "{\"name\":\"ada\",\"age\":42,\"active\":true}");
+}
+
+// queryWire fix: a mongo ResultSet (one "document" Text column per row, holding the document's JSON) must
+// re-encode into a WireRows whose count() equals the row count and whose packed bytes recover each JSON
+// cell. The old queryWire returned WireRows(rs.columns) with an EMPTY buffer -> count() == 0 forever, so
+// db.query<T> silently returned no rows. This exercises the exact mechanism queryWire now uses
+// (db.wireRowsFromResultSet over the materialised ResultSet).
+@test
+fn test_querywire_populates_rows(): void {
+    let rs = db.ResultSet();
+    rs.columns.push(db.Column("document", db.DbType.Text));
+    let j0 = "{\"name\":\"ada\",\"age\":42}";
+    let j1 = "{\"name\":\"grace\",\"age\":37}";
+    let r0 = db.Row(); r0.cells.push(db.dbText(j0)); rs.rows.push(r0);
+    let r1 = db.Row(); r1.cells.push(db.dbText(j1)); rs.rows.push(r1);
+
+    let w = db.wireRowsFromResultSet(rs);
+    assert.equalInt(w.count(), 2);                                   // not 0 (the old bug)
+    assert.equalStr(db.wireTextAt(w.base, w.offs.at(0), 0), j0);
+    assert.equalStr(db.wireTextAt(w.base, w.offs.at(1), 0), j1);
+}
